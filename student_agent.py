@@ -132,7 +132,7 @@ class Game2048Env(gym.Env):
 
         return True
 
-    def step(self, action):
+    def step(self, action, add_tile=True):
         """Execute one action"""
         assert self.action_space.contains(action), "Invalid action"
 
@@ -149,7 +149,7 @@ class Game2048Env(gym.Env):
 
         self.last_move_valid = moved  # Record if the move was valid
 
-        if moved:
+        if add_tile and moved:
             self.add_random_tile()
 
         done = self.is_game_over()
@@ -231,10 +231,148 @@ class Game2048Env(gym.Env):
         # If the simulated board is different from the current board, the move is legal
         return not np.array_equal(self.board, temp_board)
 
+# log table
+TIMBERS = {
+    0: 0,
+    2: 1,
+    4: 2,
+    8: 3,
+    16: 4,
+    32: 5,
+    64: 6,
+    128: 7,
+    256: 8,
+    512: 9,
+    1024: 10,
+    2048: 11,
+    4096: 12,
+    8192: 13,
+    16384: 14,
+    32768: 15,
+    65536: 16,
+    131072: 17,
+    262144: 18,
+    524288: 19,
+    1048576: 20,
+    2097152: 21
+}
+
+def r90(pattern, board_size):
+    return [(j, board_size - 1 - i) for (i, j) in pattern]
+
+def r180(pattern, board_size):
+    return [(board_size - 1 - i, board_size - 1 - j) for (i, j) in pattern]
+
+def r270(pattern, board_size):
+    return [(board_size - 1 - j, i) for (i, j) in pattern]
+
+def reflect(pattern, board_size):
+    return [(i, board_size - 1 - j) for (i, j) in pattern]
+
+class NTupleApproximator:
+    def __init__(self, board_size, patterns):
+        self.board_size = board_size
+        self.patterns = patterns
+        self.bias = [np.zeros(16**6, dtype=np.float32) for _ in patterns]
+        self.symmetry_groups = [self.generate_symmetries(p) for p in patterns]
+
+    def generate_symmetries(self, pattern):
+        zero  = pattern
+        one   = r90(pattern, self.board_size)
+        two   = r180(pattern, self.board_size)
+        three = r270(pattern, self.board_size)
+        return [
+            zero,
+            one,
+            two,
+            three,
+            reflect(zero, self.board_size),
+            reflect(one, self.board_size),
+            reflect(two, self.board_size),
+            reflect(three, self.board_size)
+        ]
+
+    def get_feature(self, board, coords):
+        return tuple(TIMBERS[board[coord]] for coord in coords)
+
+    def feature_index(self, feature):
+        # Interpret 6-tuple of 4-bit values as base-16 little-endian
+        return sum((v & 0xF) << (4 * i) for i, v in enumerate(feature))
+
+    def value(self, board):
+        total = 0
+        for i, syms in enumerate(self.symmetry_groups):
+            for pattern in syms:
+                feature = self.get_feature(board, pattern)
+                total += self.bias[i][self.feature_index(feature)]
+        return total
+
+def load_weights(filepath, approximator):
+    with open(filepath, "rb") as f:
+        # Read number of patterns
+        pattern_count = int.from_bytes(f.read(8), byteorder="little")
+
+        for i in range(pattern_count):
+            # Read length
+            name_length = int.from_bytes(f.read(4), byteorder="little")
+            # Read pattern name
+            name_bytes = f.read(name_length)
+            pattern_name = name_bytes.decode('utf-8')
+
+            # Read weight size
+            weight_size = int.from_bytes(f.read(8), byteorder="little")
+
+            # Read 16777216 float32 weights
+            weight_block = f.read(16777216 * 4)
+            if len(weight_block) != 16777216 * 4:
+                raise ValueError("Incomplete weight block for pattern", i)
+
+            approximator.bias[i] = np.frombuffer(weight_block, dtype=np.float32)
+
+patterns = [
+    [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)],
+    [(0, 1), (0, 2), (1, 1), (1, 2), (2, 1), (3, 1)],
+    [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1)],
+    [(0, 0), (0, 1), (1, 1), (1, 2), (1, 3), (2, 2)],
+    [(0, 0), (0, 1), (0, 2), (1, 1), (2, 1), (2, 2)],
+    [(0, 0), (0, 1), (1, 1), (2, 1), (3, 1), (3, 2)],
+    [(0, 0), (0, 1), (1, 1), (2, 0), (2, 1), (3, 1)],
+    [(0, 0), (0, 1), (0, 2), (1, 0), (1, 2), (2, 2)],
+]
+
+approximator = NTupleApproximator(board_size=4, patterns=patterns)
+load_weights("2048.bin", approximator)
+
 def get_action(state, score):
     env = Game2048Env()
-    return random.choice([0, 1, 2, 3]) # Choose a random action
-    
-    # You can submit this random agent to evaluate the performance of a purely random strategy.
+    env.board = state
+    env.score = score
 
+    best_action = 0
+    best_rating = -10000000
+    for mv in [a for a in [0, 1, 2, 3] if env.is_move_legal(a)]:
+        env_copy = copy.deepcopy(env)
+        new_state, _, _, _ = env_copy.step(mv, add_tile=False)
+        rating = approximator.value(new_state)
+        if rating > best_rating:
+            best_action = mv
+            best_rating = rating
 
+    return best_action
+
+"""
+def test(num_episodes=10):
+    env = Game2048Env()
+    for episode in range(num_episodes):
+        state = env.reset()
+        score = env.score
+        done = False
+
+        while not done:
+            action = get_action(state, score)
+            state, score, done, _ = env.step(action)
+
+        print(f"Episode {episode + 1} done: score {env.score}")
+
+test()
+"""

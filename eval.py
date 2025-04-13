@@ -18,9 +18,8 @@ import env
 
 
 if __name__ == "__main__":
-    env.eval_score()  
-    
+    env.eval_score()
 
 
 
-    
+
