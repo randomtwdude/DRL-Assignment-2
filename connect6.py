@@ -1,12 +1,103 @@
 import sys
 import numpy as np
 import random
+import copy
+import time
+
+# UCT Node for MCTS
+class UCTNode:
+    def __init__(self, candidates, turn, parent=None):
+        self.available_moves = set(candidates) # copy
+        self.tomove = turn
+        self.parent = parent
+        self.children = {}
+        self.visits = 0
+        self.avg = 0
+
+    def uct_rating(self, c):
+        return self.avg + c * np.sqrt(np.log(1 + self.parent.visits) / (self.visits + 1e-8))
+
+
+class UCTMCTS:
+    def __init__(self, game,exploration_constant=72.7, rollout_depth=20):
+        self.game = game
+        self.side = game.turn
+        self.c = exploration_constant
+        self.rollout_depth = rollout_depth
+
+    def select_child(self, node):
+        return max(node.children, key = lambda k: node.children[k].uct_rating(self.c))
+
+    def rollout(self, sim_game, depth):
+        current_side = sim_game.turn
+
+        for i in range(depth):
+            result = sim_game.check_win()
+            if result > 0:
+                break
+
+            selected = random.choice(list(sim_game.candidates))
+            move_str = f"{sim_game.index_to_label(selected[1])}{selected[0] + 1}"
+            sim_game.play_move(current_side, move_str, do_print=False)
+
+            if i % 2:
+                current_side = 3 - current_side # switch side
+
+        if result == 0:
+            return sim_game.heuristic(self.side)
+        elif result == self.side:
+            return 100000
+        else:
+            return -100000
+
+    def backpropagate(self, node, result):
+        while node is not None:
+            node.visits += 1
+            node.avg += (result - node.avg) / node.visits
+            node = node.parent
+
+    def run_simulation(self, root):
+        node = root
+        sim_game = copy.deepcopy(self.game)
+
+        # select
+        while not node.available_moves:
+            move = self.select_child(node)
+            move_str = f"{sim_game.index_to_label(move[1])}{move[0] + 1}"
+            sim_game.play_move(node.tomove, move_str, do_print=False)
+            node = node.children[move]
+
+        # expand
+        move = node.available_moves.pop()
+        move_str = f"{sim_game.index_to_label(move[1])}{move[0] + 1}"
+        sim_game.play_move(node.tomove, move_str, do_print=False)
+
+        new_node = UCTNode(sim_game.candidates, sim_game.turn, node)
+        node.children[move] = new_node
+
+        # Rollout: Simulate a random game from the expanded node.
+        rollout_reward = self.rollout(sim_game, self.rollout_depth)
+        # Backpropagation: Update the tree with the rollout reward.
+        self.backpropagate(node.children[move], rollout_reward)
+
+    def decide(self, root):
+        if len(root.available_moves) == 1:
+            return root.available_moves.pop()
+
+        best_visits = -1
+        best_action = None
+        for action, child in root.children.items():
+            if child.visits > best_visits:
+                best_visits = child.visits
+                best_action = action
+        return best_action
 
 class Connect6Game:
     def __init__(self, size=19):
         self.size = size
         self.board = np.zeros((size, size), dtype=int)  # 0: Empty, 1: Black, 2: White
         self.turn = 1  # 1: Black, 2: White
+        self.candidates = {(15, 15)} # all empty squares around where are stones
         self.game_over = False
 
     def reset_board(self):
@@ -23,6 +114,66 @@ class Connect6Game:
         self.turn = 1
         self.game_over = False
         print("= ", flush=True)
+
+    def update_candidates(self, move, radius=2):
+        """Call after playing"""
+        try:
+            self.candidates.remove(move)
+        except KeyError:
+            pass # it's probably fine
+        for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
+            for i in range(-radius, radius + 1):
+                pos_x = move[1] + i * dx
+                pos_y = move[0] + i * dy
+                if pos_x < 0 or pos_x >= self.size or pos_y < 0 or pos_y >= self.size:
+                    continue
+                if self.board[pos_x][pos_y] == 0:
+                    self.candidates.add((pos_x, pos_y))
+
+    def heuristic(self, side):
+        black, white = self.evaluate_board()
+        return (black - white) if side == 1 else (white - black)
+
+    def evaluate_board(self):
+        """Use heuristic()!"""
+        score_b = score_w = 0
+        directions = [(1,0), (0,1), (1,1), (1,-1)]
+        for x in range(self.size):
+            for y in range(self.size):
+                for dx, dy in directions:
+                    count_b = count_w = 0
+                    for i in range(6):
+                        nx, ny = x + i * dx, y + i * dy
+                        if 0 <= nx < 19 and 0 <= ny < 19:
+                            if self.board[nx][ny] == 1: # black
+                                count_b += 1
+                                count_w = 0
+                            elif self.board[nx][ny] == 2: # white
+                                count_w += 1
+                                count_b = 0
+                        else:
+                            count_b = count_w = 0
+                            break
+
+                    if count_b == 6:
+                        score_b += 50000
+                    elif count_b == 5:
+                        score_b += 5000
+                    elif count_b == 4:
+                        score_b += 500
+                    elif count_b == 3:
+                        score_b += 50
+
+                    if count_w == 6:
+                        score_w += 50000
+                    elif count_w == 5:
+                        score_w += 5000
+                    elif count_w == 4:
+                        score_w += 500
+                    elif count_w == 3:
+                        score_w += 50
+
+        return score_b, score_w
 
     def check_win(self):
         """Checks if a player has won.
@@ -62,11 +213,16 @@ class Connect6Game:
         else:
             return ord(col_char) - ord('A')
 
-    def play_move(self, color, move):
+    def play_move(self, color, move, do_print=True):
         """Places stones and checks the game status."""
         if self.game_over:
             print("? Game over")
             return
+
+        if color == 1:
+            color = 'b'
+        elif color == 2:
+            color = 'w'
 
         stones = move.split(',')
         positions = []
@@ -98,18 +254,28 @@ class Connect6Game:
             self.board[row, col] = 1 if color.upper() == 'B' else 2
 
         self.turn = 3 - self.turn
-        print('= ', end='', flush=True)
+        if do_print:
+            print('= ', end='', flush=True)
+
+        # transform "Q16" (label(move[1])move[0]+1) back to (15, 15)
+        move = (int(move[1:]) - 1, self.label_to_index(move[0]))
+        self.update_candidates(move)
 
     def generate_move(self, color):
-        """Generates a random move for the computer."""
+        """MCTS"""
         if self.game_over:
             print("? Game over")
             return
 
-        empty_positions = [(r, c) for r in range(self.size) for c in range(self.size) if self.board[r, c] == 0]
-        selected = random.sample(empty_positions, 1)
-        move_str = ",".join(f"{self.index_to_label(c)}{r+1}" for r, c in selected)
+        mcts = UCTMCTS(self)
+        root = UCTNode(self.candidates, self.turn)
+        if len(root.available_moves) > 1:
+            start_time = time.time()
+            while time.time() - start_time < 7: # just run for 7 seconds
+                mcts.run_simulation(root)
+        selected = mcts.decide(root)
 
+        move_str = f"{self.index_to_label(selected[1])}{selected[0] + 1}"
         self.play_move(color, move_str)
 
         print(f"{move_str}\n\n", end='', flush=True)
